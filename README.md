@@ -106,3 +106,57 @@ int main()
    shared_ptr<S> sp2 = p->not_dangerous();     // don't do this
 }
 ```
+
+
+# 2. Using std::move on shared_ptr object argument inside the function
+(taken from: https://stackoverflow.com/questions/41871115/why-would-i-stdmove-an-stdshared-ptr )
+
+Let's suggest a better form of transfering shared_ptr object argument inside function body
+```cpp
+void CompilerInstance::setInvocation(
+    std::shared_ptr<CompilerInvocation> Value) {
+  Invocation = std::move(Value);
+}
+```
+
+instead using that
+
+```cpp
+void CompilerInstance::setInvocation(
+    std::shared_ptr<CompilerInvocation> Value) {
+  Invocation = Value;
+}
+```
+
+Move operations (like move constructor) for std::shared_ptr are cheap, as they basically are "stealing pointers" (from source to destination; to be more precise, the whole state control block is "stolen" from source to destination, including the reference count information).
+
+Instead copy operations on std::shared_ptr invoke atomic reference count increase (i.e. not just ++RefCount on an integer RefCount data member, but e.g. calling InterlockedIncrement on Windows), which is more expensive than just stealing pointers/state.
+
+So, analyzing the ref count dynamics of this case in details:
+
+```cpp
+// shared_ptr<CompilerInvocation> sp;
+compilerInstance.setInvocation(sp);
+```
+If you pass ***sp*** by value and then take a copy inside the CompilerInstance::setInvocation method, you have:
+
+1. When entering the method, the shared_ptr parameter is copy constructed: ref count atomic increment.
+
+2. Inside the method's body, you copy the shared_ptr parameter into the data member: ref count atomic increment.
+
+3. When exiting the method, the shared_ptr parameter is destructed: ref count atomic decrement.
+
+You have two atomic increments and one atomic decrement, for a total of three atomic operations.
+
+Instead, if you pass the shared_ptr parameter by value and then std::move inside the method (as properly done in Clang's code), you have:
+
+1. When entering the method, the shared_ptr parameter is copy constructed: ref count atomic increment.
+
+2. Inside the method's body, you std::move the shared_ptr parameter into the data member: ref count does not change! You are just stealing pointers/state: no expensive atomic ref count operations are involved.
+
+3. When exiting the method, the shared_ptr parameter is destructed; but since you moved in step 2, there's nothing to destruct, as the shared_ptr parameter is not pointing to anything anymore. Again, no atomic decrement happens in this case.
+
+Bottom line: in this case you get just one ref count atomic increment, i.e. just one atomic operation.
+As you can see, this is much better than two atomic increments plus one atomic decrement (for a total of three atomic operations) for the copy case.
+
+***By using move you avoid increasing, and then immediately decreasing, the number of shares. That might save you some expensive atomic operations on the use count.***
